@@ -22,7 +22,6 @@ import idc
 
 from .rpc import tool
 from .sync import idasync
-from .utils import parse_address
 
 
 # ============================================================================

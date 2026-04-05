@@ -128,8 +128,30 @@ def _proxy_to_instance(host: str, port: int, payload: bytes | str | dict) -> dic
         conn.close()
 
 
+_broker_client = None  # Set when running in --broker mode
+
+
 def _proxy_to_ida(payload: bytes | str | dict) -> dict:
-    """Send a JSON-RPC request to the active IDA instance and return the response."""
+    """Send a JSON-RPC request to the active IDA instance and return the response.
+
+    In broker mode, requests are forwarded through the BrokerClient's /api/request
+    endpoint which uses SSE to reach the IDA instance. In standard mode, requests
+    go directly to the IDA RPC HTTP server.
+    """
+    if _broker_client is not None:
+        if isinstance(payload, (bytes, bytearray)):
+            request = json.loads(payload)
+        elif isinstance(payload, str):
+            request = json.loads(payload)
+        else:
+            request = payload
+        response = _broker_client.send_request(request, timeout=60.0)
+        if response is None:
+            raise RuntimeError(
+                "Broker returned no response. Is an IDA instance connected? "
+                "Press Ctrl+Alt+M in IDA to register with the broker."
+            )
+        return response
     return _proxy_to_instance(IDA_HOST, IDA_PORT, payload)
 
 
@@ -511,10 +533,14 @@ def main():
     # via SSE channels managed by the broker.
     # ------------------------------------------------------------------
     if args.broker:
+        global _broker_client
+
         try:
             from .http_server import IDAHttpServer
+            from .broker_client import BrokerClient
         except ImportError:
             from http_server import IDAHttpServer
+            from broker_client import BrokerClient
 
         broker = IDAHttpServer(port=args.broker_port)
         print(
@@ -523,11 +549,9 @@ def main():
         )
         broker.start()
 
-        # Also start the MCP server so AI clients can connect.
-        # In broker mode the dispatch_proxy will forward tool calls to the
-        # broker's currently-selected IDA instance via the standard HTTP
-        # proxy path (IDA_HOST / IDA_PORT already point to 127.0.0.1:13337
-        # which is the broker itself).
+        # Wire up the broker client so _proxy_to_ida forwards through the
+        # broker's /api/request endpoint instead of direct IDA HTTP RPC.
+        _broker_client = BrokerClient(base_url=f"http://127.0.0.1:{args.broker_port}")
         try:
             transport = args.transport or "stdio"
             if transport == "stdio":
