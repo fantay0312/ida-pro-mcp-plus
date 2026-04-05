@@ -117,6 +117,7 @@ IDALIB_MANAGEMENT_TOOLS = {
 }
 
 _ISOLATED_CONTEXTS_ENABLED = False
+_STARTUP_SESSION_ID: str | None = None
 
 
 def _resolve_effective_context_id() -> str:
@@ -144,6 +145,17 @@ def _context_response_fields(context_id: str) -> IdalibContextFields:
     }
 
 
+def _bind_startup_session_if_needed(manager: Any, context_id: str) -> None:
+    """Populate new isolated contexts with the startup session by default."""
+    if not _ISOLATED_CONTEXTS_ENABLED or _STARTUP_SESSION_ID is None:
+        return
+    if manager.get_context_session_id(context_id) is not None:
+        return
+    if manager.get_session(_STARTUP_SESSION_ID) is None:
+        return
+    manager.bind_context(context_id, _STARTUP_SESSION_ID, activate=False)
+
+
 def _install_context_activation_hooks() -> None:
     if getattr(MCP_SERVER, "_idalib_context_hooks_installed", False):
         return
@@ -157,6 +169,7 @@ def _install_context_activation_hooks() -> None:
             try:
                 manager = get_session_manager()
                 context_id = _resolve_effective_context_id()
+                _bind_startup_session_if_needed(manager, context_id)
                 manager.activate_context(context_id)
             except Exception as e:
                 return {
@@ -173,6 +186,7 @@ def _install_context_activation_hooks() -> None:
         try:
             manager = get_session_manager()
             context_id = _resolve_effective_context_id()
+            _bind_startup_session_if_needed(manager, context_id)
             manager.activate_context(context_id)
         except Exception as e:
             return {
@@ -230,8 +244,11 @@ def idalib_close(
     """Close an IDA session and remove all context bindings targeting it."""
 
     try:
+        global _STARTUP_SESSION_ID
         manager = get_session_manager()
         if manager.close_session(session_id):
+            if _STARTUP_SESSION_ID == session_id:
+                _STARTUP_SESSION_ID = None
             return {"success": True, "message": f"Session closed: {session_id}"}
         return {"success": False, "error": f"Session not found: {session_id}"}
     except Exception as e:
@@ -293,6 +310,7 @@ def idalib_list() -> IdalibListResult:
     try:
         manager = get_session_manager()
         context_id = _resolve_effective_context_id()
+        _bind_startup_session_if_needed(manager, context_id)
         sessions = manager.list_sessions(context_id=context_id)
         current_context_session_id = manager.get_context_session_id(context_id)
         return {
@@ -312,6 +330,7 @@ def idalib_current() -> IdalibCurrentResult:
     try:
         manager = get_session_manager()
         context_id = _resolve_effective_context_id()
+        _bind_startup_session_if_needed(manager, context_id)
         session = manager.get_context_session(context_id)
         if session is None:
             return {
@@ -347,6 +366,7 @@ def idalib_save(
     try:
         manager = get_session_manager()
         context_id = _resolve_effective_context_id()
+        _bind_startup_session_if_needed(manager, context_id)
 
         if session_id:
             manager.bind_context(context_id, session_id, activate=True)
@@ -384,6 +404,7 @@ def idalib_health(
     try:
         manager = get_session_manager()
         context_id = _resolve_effective_context_id()
+        _bind_startup_session_if_needed(manager, context_id)
 
         if session_id:
             session = manager.bind_context(context_id, session_id, activate=True)
@@ -432,6 +453,7 @@ def idalib_warmup(
     try:
         manager = get_session_manager()
         context_id = _resolve_effective_context_id()
+        _bind_startup_session_if_needed(manager, context_id)
 
         if session_id:
             session = manager.bind_context(context_id, session_id, activate=True)
@@ -468,6 +490,8 @@ def idalib_warmup(
 
 
 def main():
+    global _STARTUP_SESSION_ID
+
     parser = argparse.ArgumentParser(description="MCP server for IDA Pro via idalib")
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="Show debug messages"
@@ -527,19 +551,23 @@ def main():
             args.input_path, run_auto_analysis=True
         )
         logger.info("Initial session created: %s", session_id)
+        _STARTUP_SESSION_ID = session_id
 
-        startup_context_id = (
-            STDIO_DEFAULT_CONTEXT_ID
-            if _ISOLATED_CONTEXTS_ENABLED
-            else SHARED_FALLBACK_CONTEXT_ID
-        )
-        session_manager.bind_context(startup_context_id, session_id, activate=True)
-        logger.info(
-            "Bound startup session %s to context %s",
-            session_id,
-            startup_context_id,
-        )
+        if _ISOLATED_CONTEXTS_ENABLED:
+            logger.info(
+                "Startup session %s will be attached lazily to new isolated contexts",
+                session_id,
+            )
+        else:
+            startup_context_id = SHARED_FALLBACK_CONTEXT_ID
+            session_manager.bind_context(startup_context_id, session_id, activate=True)
+            logger.info(
+                "Bound startup session %s to context %s",
+                session_id,
+                startup_context_id,
+            )
     else:
+        _STARTUP_SESSION_ID = None
         logger.info(
             "No initial binary specified. Use idalib_open() to load binaries dynamically."
         )

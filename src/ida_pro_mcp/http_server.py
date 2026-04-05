@@ -17,6 +17,18 @@ from typing import Callable, Optional
 from urllib.parse import parse_qs, urlparse
 import sys
 
+try:
+    from .ida_mcp.discovery import clear_broker_endpoint, write_broker_endpoint
+except ImportError:
+    try:
+        from ida_mcp.discovery import clear_broker_endpoint, write_broker_endpoint
+    except ImportError:
+        def write_broker_endpoint(host: str, port: int) -> str:
+            return ""
+
+        def clear_broker_endpoint(host: str | None = None, port: int | None = None) -> bool:
+            return False
+
 
 @dataclass
 class IDAInstance:
@@ -439,6 +451,7 @@ class IDAHttpServer:
         self._server: Optional[HTTPServer] = None
         self._thread: Optional[threading.Thread] = None
         self._running = False
+        self._advertised_endpoint: tuple[str, int] | None = None
 
     def start(self):
         """启动服务器"""
@@ -451,6 +464,8 @@ class IDAHttpServer:
             self._running = True
             self._thread = threading.Thread(target=self._serve, daemon=True)
             self._thread.start()
+            self._advertised_endpoint = ("127.0.0.1", self.port)
+            write_broker_endpoint(*self._advertised_endpoint)
 
             print(f"[HTTP] 服务器已启动 (多线程): http://127.0.0.1:{self.port}", file=sys.stderr)
             sys.stderr.flush()
@@ -473,6 +488,9 @@ class IDAHttpServer:
     def stop(self):
         """停止服务器"""
         self._running = False
+        if self._advertised_endpoint is not None:
+            clear_broker_endpoint(*self._advertised_endpoint)
+            self._advertised_endpoint = None
         if self._server:
             try:
                 self._server.server_close()

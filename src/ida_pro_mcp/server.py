@@ -3,6 +3,8 @@ import http.client
 import json
 import os
 import sys
+import threading
+import time
 import traceback
 from typing import Annotated, Any, TYPE_CHECKING, TypedDict
 from urllib.parse import urlparse
@@ -74,13 +76,196 @@ class ProxyOpenFileResult(TypedDict, total=False):
     result: Any
 
 
-IDA_HOST = "127.0.0.1"
-IDA_PORT = 13337
+DEFAULT_IDA_HOST = "127.0.0.1"
+DEFAULT_IDA_PORT = 13337
+IDA_HOST = DEFAULT_IDA_HOST
+IDA_PORT = DEFAULT_IDA_PORT
 
 mcp = McpServer("ida-pro-mcp")
 dispatch_original = mcp.registry.dispatch
 
 LOCAL_TOOLS = {"list_instances", "select_instance", "open_file"}
+_target_lock = threading.Lock()
+_session_targets: dict[str, tuple[str, int]] = {}
+_broker_instance_id: str | None = None
+_broker_session_targets: dict[str, str] = {}
+
+
+def _get_transport_session_key() -> str | None:
+    return mcp.get_current_transport_session_id()
+
+
+def _get_direct_target() -> tuple[str, int]:
+    session_key = _get_transport_session_key()
+    if session_key is not None:
+        with _target_lock:
+            target = _session_targets.get(session_key)
+        if target is not None:
+            return target
+    return IDA_HOST, IDA_PORT
+
+
+def _set_direct_target(host: str, port: int) -> None:
+    global IDA_HOST, IDA_PORT
+
+    session_key = _get_transport_session_key()
+    if session_key is not None:
+        with _target_lock:
+            _session_targets[session_key] = (host, port)
+        return
+
+    IDA_HOST = host
+    IDA_PORT = port
+    set_ida_rpc(host, port)
+
+
+def _clear_direct_target() -> None:
+    global IDA_HOST, IDA_PORT
+
+    session_key = _get_transport_session_key()
+    if session_key is not None:
+        with _target_lock:
+            _session_targets.pop(session_key, None)
+        return
+
+    IDA_HOST = DEFAULT_IDA_HOST
+    IDA_PORT = DEFAULT_IDA_PORT
+    set_ida_rpc(IDA_HOST, IDA_PORT)
+
+
+def _get_broker_target() -> str | None:
+    session_key = _get_transport_session_key()
+    if session_key is not None:
+        with _target_lock:
+            target = _broker_session_targets.get(session_key)
+        if target is not None:
+            return target
+    return _broker_instance_id
+
+
+def _set_broker_target(instance_id: str) -> None:
+    global _broker_instance_id
+
+    session_key = _get_transport_session_key()
+    if session_key is not None:
+        with _target_lock:
+            _broker_session_targets[session_key] = instance_id
+        return
+
+    _broker_instance_id = instance_id
+
+
+def _clear_broker_target() -> None:
+    global _broker_instance_id
+
+    session_key = _get_transport_session_key()
+    if session_key is not None:
+        with _target_lock:
+            _broker_session_targets.pop(session_key, None)
+        return
+
+    _broker_instance_id = None
+
+
+def _parse_broker_instance_id(instance_id: str) -> tuple[int | None, int | None]:
+    parts = instance_id.rsplit("-", 2)
+    if len(parts) != 3:
+        return None, None
+    try:
+        return int(parts[1]), int(parts[2])
+    except ValueError:
+        return None, None
+
+
+def _normalize_broker_instance(
+    instance: dict[str, Any], active_instance_id: str | None
+) -> ProxyInstanceInfo:
+    instance_id = str(instance.get("instance_id", ""))
+    parsed_pid, parsed_port = _parse_broker_instance_id(instance_id)
+    host = str(instance.get("host") or DEFAULT_IDA_HOST)
+    port = instance.get("port")
+    if not isinstance(port, int):
+        port = parsed_port
+    pid = instance.get("pid")
+    if not isinstance(pid, int):
+        pid = parsed_pid
+    binary = (
+        instance.get("binary")
+        or instance.get("name")
+        or os.path.basename(str(instance.get("binary_path", "")))
+        or instance_id
+    )
+    result: ProxyInstanceInfo = {
+        "host": host,
+        "reachable": True,
+        "active": instance_id == active_instance_id,
+    }
+    if isinstance(port, int):
+        result["port"] = port
+    if isinstance(pid, int):
+        result["pid"] = pid
+    if binary:
+        result["binary"] = str(binary)
+    idb_path = instance.get("idb_path") or instance.get("binary_path")
+    if isinstance(idb_path, str) and idb_path:
+        result["idb_path"] = idb_path
+    started_at = instance.get("started_at")
+    if isinstance(started_at, str) and started_at:
+        result["started_at"] = started_at
+    return result
+
+
+def _get_effective_broker_target() -> str | None:
+    if _broker_client is None:
+        return None
+    selected = _get_broker_target()
+    if selected is not None:
+        return selected
+    current = _broker_client.get_current()
+    if isinstance(current, dict):
+        instance_id = current.get("instance_id")
+        if isinstance(instance_id, str) and instance_id:
+            return instance_id
+    return None
+
+
+def _list_broker_instances_raw() -> list[dict[str, Any]]:
+    if _broker_client is None:
+        return []
+    instances = _broker_client.list_instances()
+    return [inst for inst in instances if isinstance(inst, dict)]
+
+
+def _list_broker_instances() -> list[ProxyInstanceInfo]:
+    active_instance_id = _get_effective_broker_target()
+    return [
+        _normalize_broker_instance(instance, active_instance_id)
+        for instance in _list_broker_instances_raw()
+    ]
+
+
+def _find_broker_instance(host: str, port: int) -> dict[str, Any] | None:
+    for instance in _list_broker_instances_raw():
+        normalized = _normalize_broker_instance(instance, None)
+        if normalized.get("host") == host and normalized.get("port") == port:
+            return instance
+    return None
+
+
+def _extract_tool_result(response: dict[str, Any]) -> Any:
+    if "error" in response:
+        raise RuntimeError(response["error"].get("message", "Unknown error"))
+
+    result = response.get("result", {})
+    if result.get("isError"):
+        content = result.get("content", [])
+        message = (
+            content[0].get("text", "Unknown tool error")
+            if content
+            else "Unknown tool error"
+        )
+        raise RuntimeError(message)
+    return result.get("structuredContent")
 
 
 def _get_proxy_request_path() -> str:
@@ -145,14 +330,19 @@ def _proxy_to_ida(payload: bytes | str | dict) -> dict:
             request = json.loads(payload)
         else:
             request = payload
-        response = _broker_client.send_request(request, timeout=60.0)
+        response = _broker_client.send_request(
+            request,
+            instance_id=_get_effective_broker_target(),
+            timeout=60.0,
+        )
         if response is None:
             raise RuntimeError(
                 "Broker returned no response. Is an IDA instance connected? "
                 "Press Ctrl+Alt+M in IDA to register with the broker."
             )
         return response
-    return _proxy_to_instance(IDA_HOST, IDA_PORT, payload)
+    host, port = _get_direct_target()
+    return _proxy_to_instance(host, port, payload)
 
 
 def _call_ida_tool(host: str, port: int, name: str, arguments: dict[str, Any]) -> Any:
@@ -167,19 +357,55 @@ def _call_ida_tool(host: str, port: int, name: str, arguments: dict[str, Any]) -
             "params": {"name": name, "arguments": arguments},
         },
     )
-    if "error" in response:
-        raise RuntimeError(response["error"].get("message", "Unknown error"))
+    return _extract_tool_result(response)
 
-    result = response.get("result", {})
-    if result.get("isError"):
-        content = result.get("content", [])
-        message = (
-            content[0].get("text", "Unknown tool error")
-            if content
-            else "Unknown tool error"
-        )
-        raise RuntimeError(message)
-    return result.get("structuredContent")
+
+def _call_broker_tool(instance_id: str, name: str, arguments: dict[str, Any]) -> Any:
+    """Call an MCP tool through the broker for a specific connected instance."""
+    if _broker_client is None:
+        raise RuntimeError("Broker client is not available")
+
+    response = _broker_client.send_request(
+        {
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {"name": name, "arguments": arguments},
+        },
+        instance_id=instance_id,
+        timeout=60.0,
+    )
+    if response is None:
+        raise RuntimeError("Broker returned no response")
+    return _extract_tool_result(response)
+
+
+def _resolve_broker_instance_id_from_result(
+    result: dict[str, Any], wait_timeout_sec: int
+) -> str | None:
+    host = result.get("host")
+    port = result.get("port")
+    pid = result.get("pid")
+    if not isinstance(host, str):
+        host = DEFAULT_IDA_HOST
+
+    deadline = time.monotonic() + max(0.0, min(float(wait_timeout_sec), 5.0))
+    while True:
+        for instance in _list_broker_instances_raw():
+            normalized = _normalize_broker_instance(instance, None)
+            if isinstance(port, int) and normalized.get("port") == port:
+                return str(instance.get("instance_id", ""))
+            if isinstance(pid, int) and normalized.get("pid") == pid:
+                return str(instance.get("instance_id", ""))
+            if (
+                isinstance(port, int)
+                and normalized.get("host") == host
+                and normalized.get("port") == port
+            ):
+                return str(instance.get("instance_id", ""))
+        if time.monotonic() >= deadline:
+            return None
+        time.sleep(0.25)
 
 
 def dispatch_proxy(request: dict | str | bytes | bytearray) -> JsonRpcResponse | None:
@@ -267,14 +493,18 @@ mcp.registry.dispatch = dispatch_proxy
 @mcp.tool
 def list_instances() -> list[ProxyInstanceInfo]:
     """List discovered IDA Pro instances and indicate which one is active."""
+    if _broker_client is not None:
+        return _list_broker_instances()
+
     result = []
+    active_host, active_port = _get_direct_target()
     for inst in discover_instances():
         reachable = probe_instance(inst["host"], inst["port"])
         result.append(
             {
                 **inst,
                 "reachable": reachable,
-                "active": inst["host"] == IDA_HOST and inst["port"] == IDA_PORT,
+                "active": inst["host"] == active_host and inst["port"] == active_port,
             }
         )
     return result
@@ -290,22 +520,47 @@ def select_instance(
     Use list_instances first to see available instances, then select one by port.
     All subsequent tool calls will be routed to the selected instance.
     """
-    global IDA_HOST, IDA_PORT
-    if port == 0:
-        IDA_HOST = "127.0.0.1"
-        IDA_PORT = 13337
-        set_ida_rpc(IDA_HOST, IDA_PORT)
+    if _broker_client is not None:
+        if port == 0:
+            _clear_broker_target()
+            return {
+                "success": True,
+                "message": "Reset to broker default target",
+            }
+
+        instance = _find_broker_instance(host, port)
+        if instance is None:
+            return {
+                "success": False,
+                "error": f"Broker instance at {host}:{port} is not available",
+            }
+
+        instance_id = instance.get("instance_id")
+        if not isinstance(instance_id, str) or not instance_id:
+            return {
+                "success": False,
+                "error": f"Broker instance at {host}:{port} has no instance_id",
+            }
+
+        _set_broker_target(instance_id)
         return {
             "success": True,
-            "host": IDA_HOST,
-            "port": IDA_PORT,
+            "host": host,
+            "port": port,
+            "message": f"Selected broker instance {instance_id}",
+        }
+
+    if port == 0:
+        _clear_direct_target()
+        return {
+            "success": True,
+            "host": DEFAULT_IDA_HOST,
+            "port": DEFAULT_IDA_PORT,
             "message": "Reset to default IDA target",
         }
     if not probe_instance(host, port):
         return {"success": False, "error": f"Instance at {host}:{port} is not reachable"}
-    IDA_HOST = host
-    IDA_PORT = port
-    set_ida_rpc(IDA_HOST, IDA_PORT)
+    _set_direct_target(host, port)
     return {"success": True, "host": host, "port": port}
 
 
@@ -333,8 +588,55 @@ def open_file(
     implementation so discovery/launch remains available even when the currently
     selected instance is down.
     """
-    target_host = IDA_HOST
-    target_port = IDA_PORT
+    if _broker_client is not None:
+        broker_instances = _list_broker_instances_raw()
+        if not broker_instances:
+            return {
+                "success": False,
+                "error": (
+                    "No running IDA instance is available to launch a new file. "
+                    "Start one instance first or connect one to the broker."
+                ),
+            }
+
+        instance_id = _get_effective_broker_target()
+        if instance_id is None:
+            instance_id = str(broker_instances[0].get("instance_id", ""))
+
+        if not instance_id:
+            return {
+                "success": False,
+                "error": "Broker did not provide a usable instance_id",
+            }
+
+        try:
+            result = _call_broker_tool(
+                instance_id,
+                "open_file",
+                {
+                    "file_path": file_path,
+                    "switch": switch,
+                    "autonomous": autonomous,
+                    "new_database": new_database,
+                    "timeout": timeout,
+                },
+            )
+        except Exception as e:
+            return {"success": False, "error": str(e)}
+
+        if not isinstance(result, dict):
+            return {"success": True, "result": result}
+
+        if switch:
+            launched_instance_id = _resolve_broker_instance_id_from_result(result, timeout)
+            if launched_instance_id:
+                _set_broker_target(launched_instance_id)
+                result["switched"] = True
+            else:
+                result["switched"] = False
+        return result
+
+    target_host, target_port = _get_direct_target()
     if not probe_instance(target_host, target_port):
         target_host = ""
         target_port = 0

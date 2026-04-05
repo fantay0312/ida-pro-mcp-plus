@@ -15,6 +15,11 @@ import urllib.request
 import urllib.error
 from typing import Callable, Optional
 
+try:
+    from .discovery import read_broker_endpoint
+except ImportError:
+    from discovery import read_broker_endpoint
+
 # ============================================================================
 # 配置
 # ============================================================================
@@ -43,6 +48,15 @@ _on_mcp_request: Optional[Callable[[dict], dict]] = None
 _auto_reconnect = True
 _reconnect_attempt = 0
 _last_connect_params: Optional[dict] = None
+
+
+def get_registered_server_url() -> str:
+    """Return the advertised broker URL, or the historical default."""
+    endpoint = read_broker_endpoint()
+    if endpoint is None:
+        return DEFAULT_SERVER_URL
+    host, port = endpoint
+    return f"http://{host}:{port}"
 
 
 # ============================================================================
@@ -126,7 +140,7 @@ def connect_to_server(
     }
     
     _on_mcp_request = on_mcp_request
-    _server_url = server_url or DEFAULT_SERVER_URL
+    _server_url = server_url or get_registered_server_url()
     
     # 如果已连接，先断开
     if _connected:

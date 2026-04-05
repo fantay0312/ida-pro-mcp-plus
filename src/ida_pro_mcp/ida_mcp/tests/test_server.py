@@ -57,6 +57,55 @@ class _RecordingConnection:
         pass
 
 
+class _FakeBrokerClient:
+    def __init__(self):
+        self.requests = []
+        self.instances = [
+            {
+                "instance_id": "ida-1001-11111",
+                "name": "first",
+                "binary_path": "/tmp/first.bin",
+            },
+            {
+                "instance_id": "ida-1002-22222",
+                "name": "second",
+                "binary_path": "/tmp/second.bin",
+            },
+        ]
+        self.current = self.instances[0]
+
+    def list_instances(self):
+        return [inst.copy() for inst in self.instances]
+
+    def get_current(self):
+        return self.current.copy()
+
+    def send_request(self, request, instance_id=None, timeout=60.0):
+        self.requests.append(
+            {"request": request, "instance_id": instance_id, "timeout": timeout}
+        )
+        method = request.get("method")
+        params = request.get("params", {})
+        if method == "tools/call" and params.get("name") == "open_file":
+            return {
+                "jsonrpc": "2.0",
+                "result": {
+                    "structuredContent": {
+                        "success": True,
+                        "host": "127.0.0.1",
+                        "port": 22222,
+                        "pid": 1002,
+                    }
+                },
+                "id": request.get("id"),
+            }
+        return {
+            "jsonrpc": "2.0",
+            "result": {"structuredContent": {"ok": True}},
+            "id": request.get("id"),
+        }
+
+
 @contextlib.contextmanager
 def _saved_target():
     """Preserve the currently selected IDA target across assertions."""
@@ -64,6 +113,10 @@ def _saved_target():
     old_port = server.IDA_PORT
     old_session = getattr(server.mcp._transport_session_id, "data", None)
     old_exts = getattr(server.mcp._enabled_extensions, "data", set())
+    old_session_targets = server._session_targets.copy()
+    old_broker_client = server._broker_client
+    old_broker_target = server._broker_instance_id
+    old_broker_session_targets = server._broker_session_targets.copy()
     try:
         yield
     finally:
@@ -71,6 +124,12 @@ def _saved_target():
         server.IDA_PORT = old_port
         server.mcp._transport_session_id.data = old_session
         server.mcp._enabled_extensions.data = old_exts
+        server._session_targets.clear()
+        server._session_targets.update(old_session_targets)
+        server._broker_client = old_broker_client
+        server._broker_instance_id = old_broker_target
+        server._broker_session_targets.clear()
+        server._broker_session_targets.update(old_broker_session_targets)
 
 
 @test()
@@ -105,6 +164,70 @@ def test_server_proxy_to_instance_forwards_session_and_extensions():
             assert call["headers"].get("Mcp-Session-Id") == "session-456"
         finally:
             server.http.client.HTTPConnection = original_conn
+
+
+@test()
+def test_select_instance_is_scoped_to_transport_session():
+    """HTTP transport sessions should not overwrite each other's selected direct target."""
+    with _saved_target():
+        original_probe = server.probe_instance
+        server.probe_instance = lambda host, port: True
+        try:
+            server.mcp._transport_session_id.data = "http:session-a"
+            result_a = server.select_instance(11111, "127.0.0.1")
+            assert result_a["success"] is True
+
+            server.mcp._transport_session_id.data = "http:session-b"
+            result_b = server.select_instance(22222, "127.0.0.1")
+            assert result_b["success"] is True
+
+            server.mcp._transport_session_id.data = "http:session-a"
+            assert server._get_direct_target() == ("127.0.0.1", 11111)
+
+            server.mcp._transport_session_id.data = "http:session-b"
+            assert server._get_direct_target() == ("127.0.0.1", 22222)
+        finally:
+            server.probe_instance = original_probe
+
+
+@test()
+def test_broker_instance_selection_is_scoped_to_transport_session():
+    """Broker-mode proxying should send each HTTP session to its own selected instance."""
+    with _saved_target():
+        broker = _FakeBrokerClient()
+        server._broker_client = broker
+
+        server.mcp._transport_session_id.data = "http:session-a"
+        result_a = server.select_instance(11111, "127.0.0.1")
+        assert result_a["success"] is True
+        server._proxy_to_ida(
+            {"jsonrpc": "2.0", "id": 1, "method": "tools/call", "params": {}}
+        )
+
+        server.mcp._transport_session_id.data = "http:session-b"
+        result_b = server.select_instance(22222, "127.0.0.1")
+        assert result_b["success"] is True
+        server._proxy_to_ida(
+            {"jsonrpc": "2.0", "id": 2, "method": "tools/call", "params": {}}
+        )
+
+        assert broker.requests[0]["instance_id"] == "ida-1001-11111"
+        assert broker.requests[1]["instance_id"] == "ida-1002-22222"
+
+
+@test()
+def test_broker_open_file_uses_broker_transport_and_switches_to_new_instance():
+    """open_file should route through the broker and retarget to the launched instance."""
+    with _saved_target():
+        broker = _FakeBrokerClient()
+        server._broker_client = broker
+        server.mcp._transport_session_id.data = "http:session-a"
+        result = server.open_file("/tmp/sample.bin", switch=True, timeout=0)
+        assert result["success"] is True
+        assert result["switched"] is True
+        assert broker.requests[0]["request"]["params"]["name"] == "open_file"
+        assert broker.requests[0]["instance_id"] == "ida-1001-11111"
+        assert server._get_broker_target() == "ida-1002-22222"
 
 
 # ---------------------------------------------------------------------------

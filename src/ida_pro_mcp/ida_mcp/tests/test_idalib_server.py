@@ -59,3 +59,33 @@ def test_idalib_health_treats_successful_server_health_as_ready():
         idalib_server._resolve_effective_context_id = original_resolve_context
         idalib_server._context_response_fields = original_context_fields
         idalib_server.server_health = original_server_health
+
+
+@test()
+def test_bind_startup_session_if_needed_populates_new_isolated_context():
+    """An isolated HTTP context should inherit the startup session on first use."""
+    original_isolated = idalib_server._ISOLATED_CONTEXTS_ENABLED
+    original_startup_session = idalib_server._STARTUP_SESSION_ID
+
+    class _FakeManager:
+        def __init__(self):
+            self.bound = []
+
+        def get_context_session_id(self, context_id):
+            return None
+
+        def get_session(self, session_id):
+            return object() if session_id == "startup-1" else None
+
+        def bind_context(self, context_id, session_id, activate=False):
+            self.bound.append((context_id, session_id, activate))
+
+    manager = _FakeManager()
+    idalib_server._ISOLATED_CONTEXTS_ENABLED = True
+    idalib_server._STARTUP_SESSION_ID = "startup-1"
+    try:
+        idalib_server._bind_startup_session_if_needed(manager, "http:session-a")
+        assert manager.bound == [("http:session-a", "startup-1", False)]
+    finally:
+        idalib_server._ISOLATED_CONTEXTS_ENABLED = original_isolated
+        idalib_server._STARTUP_SESSION_ID = original_startup_session

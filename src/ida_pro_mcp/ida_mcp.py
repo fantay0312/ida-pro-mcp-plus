@@ -262,9 +262,17 @@ class MCP(idaapi.plugin_t):
         """
         try:
             if TYPE_CHECKING:
-                from .ida_mcp.api_instances import connect_to_server, is_connected
+                from .ida_mcp.api_instances import (
+                    connect_to_server,
+                    get_registered_server_url,
+                    is_connected,
+                )
             else:
-                from ida_mcp.api_instances import connect_to_server, is_connected
+                from ida_mcp.api_instances import (
+                    connect_to_server,
+                    get_registered_server_url,
+                    is_connected,
+                )
 
             if is_connected():
                 return
@@ -311,6 +319,7 @@ class MCP(idaapi.plugin_t):
                 binary_path=ida_nalt.get_input_file_path() or "",
                 arch_info=arch_info,
                 on_mcp_request=_handle_broker_request,
+                server_url=get_registered_server_url(),
             )
             if success:
                 print(f"[MCP] Also registered with Broker for multi-instance management")
@@ -328,5 +337,4 @@ class MCP(idaapi.plugin_t):
 
 def PLUGIN_ENTRY():
     return MCP()
-
 

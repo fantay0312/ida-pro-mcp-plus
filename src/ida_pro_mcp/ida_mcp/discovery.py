@@ -38,6 +38,10 @@ def _instance_file_path(port: int) -> str:
     return os.path.join(get_instances_dir(), f"instance_{port}.json")
 
 
+def _broker_file_path() -> str:
+    return os.path.join(_get_ida_user_dir(), "mcp", "broker.json")
+
+
 def register_instance(
     host: str, port: int, pid: int, binary: str, idb_path: str
 ) -> str:
@@ -66,6 +70,63 @@ def register_instance(
             pass
         raise
     return file_path
+
+
+def write_broker_endpoint(host: str, port: int) -> str:
+    """Write the active broker endpoint so IDA plugins can discover it."""
+    info = {
+        "host": host,
+        "port": port,
+        "updated_at": datetime.datetime.now(datetime.timezone.utc).isoformat(),
+    }
+    file_path = _broker_file_path()
+    broker_dir = os.path.dirname(file_path)
+    os.makedirs(broker_dir, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(dir=broker_dir, prefix=".tmp_", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(info, f, indent=2)
+        os.replace(tmp_path, file_path)
+    except Exception:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise
+    return file_path
+
+
+def read_broker_endpoint() -> tuple[str, int] | None:
+    """Read the advertised broker endpoint if one is available."""
+    file_path = _broker_file_path()
+    try:
+        with open(file_path, "r", encoding="utf-8") as f:
+            info = json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return None
+
+    host = info.get("host")
+    port = info.get("port")
+    if not isinstance(host, str) or not isinstance(port, int):
+        return None
+    return host, port
+
+
+def clear_broker_endpoint(host: str | None = None, port: int | None = None) -> bool:
+    """Remove the advertised broker endpoint if it matches the expected values."""
+    file_path = _broker_file_path()
+    current = read_broker_endpoint()
+    if current is None:
+        return False
+    if host is not None and current[0] != host:
+        return False
+    if port is not None and current[1] != port:
+        return False
+    try:
+        os.unlink(file_path)
+        return True
+    except OSError:
+        return False
 
 
 def unregister_instance(port: int) -> bool:
