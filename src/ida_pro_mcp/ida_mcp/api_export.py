@@ -17,6 +17,7 @@ import ida_lines
 import ida_nalt
 import ida_segment
 import ida_xref
+import idaapi
 import idautils
 import idc
 
@@ -69,8 +70,7 @@ class ExportSegmentsResult(TypedDict):
 
 def _ensure_dir(path: str) -> None:
     """Create directory if it does not exist."""
-    if not os.path.exists(path):
-        os.makedirs(path, exist_ok=True)
+    os.makedirs(path, exist_ok=True)
 
 
 def _sanitize_filename(name: str) -> str:
@@ -254,9 +254,11 @@ def bulk_export(
         c_path = os.path.join(decompile_dir, f"{func_ea:X}.c")
         asm_path = os.path.join(disasm_dir, f"{func_ea:X}.asm")
 
-        if skip_existing and (os.path.exists(c_path) or os.path.exists(asm_path)):
+        c_exists = os.path.exists(c_path)
+        asm_exists = os.path.exists(asm_path)
+        if skip_existing and (c_exists or asm_exists):
             exported += 1
-            rel = f"decompile/{func_ea:X}.c" if os.path.exists(c_path) else f"disassembly/{func_ea:X}.asm"
+            rel = f"decompile/{func_ea:X}.c" if c_exists else f"disassembly/{func_ea:X}.asm"
             index_lines.append(f"{hex(func_ea)}\t{func_name}\t{rel}\t(cached)")
             continue
 
@@ -418,10 +420,10 @@ def export_imports(
         for i in range(nimps):
             module_name = ida_nalt.get_import_module_name(i) or "<unnamed>"
 
-            def _imp_cb(ea: int, name: str | None, ordinal: int) -> bool:
+            def _imp_cb(ea: int, name: str | None, ordinal: int, _module: str = module_name) -> bool:
                 nonlocal import_count
                 symbol = name if name else f"#{ordinal}"
-                fh.write(f"{hex(ea)}\t{module_name}\t{symbol}\n")
+                fh.write(f"{hex(ea)}\t{_module}\t{symbol}\n")
                 import_count += 1
                 return True
 
@@ -500,13 +502,13 @@ def export_segments(
 
             # Permission flags
             perms = ""
-            if seg.perm & ida_segment.SFL_LOADER:
+            if seg.sflags & ida_segment.SFL_LOADER:
                 perms += "L"
-            if seg.perm & 4:  # Read
+            if seg.perm & idaapi.SEGPERM_READ:
                 perms += "R"
-            if seg.perm & 2:  # Write
+            if seg.perm & idaapi.SEGPERM_WRITE:
                 perms += "W"
-            if seg.perm & 1:  # Execute
+            if seg.perm & idaapi.SEGPERM_EXEC:
                 perms += "X"
             if not perms:
                 perms = "---"

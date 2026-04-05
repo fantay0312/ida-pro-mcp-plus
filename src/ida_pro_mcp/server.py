@@ -501,7 +501,9 @@ def main():
         return
 
     # Resolve IDA RPC target (explicit or auto-discovery)
-    _resolve_ida_rpc(args)
+    # Skip in broker mode — the broker manages IDA instances via its own registry
+    if not args.broker:
+        _resolve_ida_rpc(args)
 
     is_install = args.install is not None
     is_uninstall = args.uninstall is not None

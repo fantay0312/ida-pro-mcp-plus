@@ -250,6 +250,73 @@ class MCP(idaapi.plugin_t):
             print(f"[MCP] Instance registration failed: {e}")
             traceback.print_exc()
 
+        # Also try to register with the Broker (if one is running)
+        self._try_broker_connect(port)
+
+    def _try_broker_connect(self, local_port: int):
+        """Attempt to register this IDA instance with a running Broker server.
+
+        This is best-effort: if no Broker is listening, it silently skips.
+        When connected, the Broker can forward MCP requests to this instance
+        via SSE, enabling multi-instance management.
+        """
+        try:
+            if TYPE_CHECKING:
+                from .ida_mcp.api_instances import connect_to_server, is_connected
+            else:
+                from ida_mcp.api_instances import connect_to_server, is_connected
+
+            if is_connected():
+                return
+
+            import os
+            import ida_nalt
+            import ida_idp
+
+            binary = ida_nalt.get_root_filename() or ""
+            instance_id = f"ida-{os.getpid()}-{local_port}"
+
+            arch_info = {}
+            try:
+                info = ida_idp.get_idp_desc()
+                arch_info["processor"] = info if isinstance(info, str) else ""
+            except Exception:
+                pass
+
+            def _handle_broker_request(request: dict) -> dict:
+                """Forward a Broker request to the local MCP server."""
+                import json
+                import urllib.request
+                body = json.dumps(request).encode("utf-8")
+                req = urllib.request.Request(
+                    f"http://127.0.0.1:{local_port}/mcp",
+                    data=body,
+                    headers={"Content-Type": "application/json"},
+                    method="POST",
+                )
+                try:
+                    with urllib.request.urlopen(req, timeout=60) as resp:
+                        return json.loads(resp.read().decode("utf-8"))
+                except Exception as e:
+                    return {
+                        "jsonrpc": "2.0",
+                        "error": {"code": -32000, "message": str(e)},
+                        "id": request.get("id"),
+                    }
+
+            success = connect_to_server(
+                instance_id=instance_id,
+                instance_type="gui",
+                name=binary,
+                binary_path=ida_nalt.get_input_file_path() or "",
+                arch_info=arch_info,
+                on_mcp_request=_handle_broker_request,
+            )
+            if success:
+                print(f"[MCP] Also registered with Broker for multi-instance management")
+        except Exception:
+            pass  # Broker not available, silently skip
+
     def term(self):
         if hasattr(self, "_ui_hooks"):
             self._ui_hooks.unhook()

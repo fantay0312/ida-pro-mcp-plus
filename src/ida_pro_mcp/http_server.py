@@ -4,6 +4,7 @@
 使用 SSE 推送 MCP 请求到 IDA。
 """
 
+import errno
 import json
 import queue
 import socketserver
@@ -454,7 +455,7 @@ class IDAHttpServer:
             print(f"[HTTP] 服务器已启动 (多线程): http://127.0.0.1:{self.port}", file=sys.stderr)
             sys.stderr.flush()
         except OSError as e:
-            if e.errno == 48:  # Address already in use
+            if e.errno == errno.EADDRINUSE:
                 print(f"[HTTP] 端口 {self.port} 已被占用，跳过 HTTP 服务器启动", file=sys.stderr)
                 sys.stderr.flush()
             else:

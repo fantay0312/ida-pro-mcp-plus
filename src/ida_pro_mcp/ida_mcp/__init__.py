@@ -37,7 +37,11 @@ from . import api_resources
 from . import api_survey
 from . import api_composite
 from . import api_discovery
-from . import api_export
+try:
+    from . import api_export
+except ImportError as _e:
+    import sys
+    print(f"[MCP] Warning: api_export not loaded ({_e}), bulk export tools unavailable", file=sys.stderr)
 
 # Re-export key components for external use
 from .sync import idasync, IDAError, IDASyncError, CancelledError
